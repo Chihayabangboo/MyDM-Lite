@@ -8,7 +8,7 @@ A **user-friendly** Windows desktop downloader for those who are completely unfa
 
 ---
 
-## One, Three-Step Usage for Beginners
+## One, Three-Step Usage for Beginners(New users please note: I have already packaged the ready-made .exe file for you, no need to package it yourself! You can download it directly from the Releases page on the right.)
 
 1. **Copy the download link** (right-click on the download address in the browser and select "Copy link").
 2. **Double-click `exe.`**.
@@ -168,7 +168,7 @@ MyDM-Lite/
 
 ---
 
-## Seven, Packaging into exe (Optional)
+## Seven, Packaging into exe (Optional)(New users please note: I have already packaged the ready-made .exe file for you, no need to package it yourself! You can download it directly from the Releases page on the right.)
 
 If there are many beginners, you can package it into a single exe for distribution, and the recipient doesn't need to install Python.
 
@@ -226,7 +226,7 @@ A: A pop-up will appear only if the download is successful; failure will prompt 
 
 ---
 
-## 一、小白三步使用法
+## 一、小白三步使用法（小白用户请注意：我已经帮你打包好了现成的的.exe文件，无需自己打包！直接去右侧Releases页面下载即可）
 
 1. **复制下载链接**（在浏览器里对着下载地址点右键 → 复制链接）。
 2. **双击 `exe.`**。
@@ -385,7 +385,7 @@ MyDM-Lite/
 
 ---
 
-## 七、打包成 exe（可选）
+## 七、打包成 exe（可选）(小白用户请注意：我已经帮你打包好了现成的的.exe文件，无需自己打包！直接去右侧Releases页面下载即可)
 
 小白用户多的话，可以打包成单个 exe 发给对方，对方就不用装 Python 了。
 
