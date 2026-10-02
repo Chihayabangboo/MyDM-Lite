@@ -11,7 +11,7 @@ A **user-friendly** Windows desktop downloader for those who are completely unfa
 ## One, Three-Step Usage for Beginners
 
 1. **Copy the download link** (right-click on the download address in the browser and select "Copy link").
-2. **Double-click `exe.`**. The first time you open it, it will automatically install a small dependency called requests. Wait for about ten seconds.
+2. **Double-click `exe.`**.
 3. The link is already filled in for you. **Simply click the big "Start Download" button**, and wait for the progress bar to complete.
 
 After downloading, a pop-up will ask, "Download complete! Do you want to open the folder?" Click "Yes" to directly view the file.
