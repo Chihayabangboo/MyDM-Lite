@@ -11,7 +11,7 @@ A **user-friendly** Windows desktop downloader for those who are completely unfa
 ## One, Three-Step Usage for Beginners
 
 1. **Copy the download link** (right-click on the download address in the browser and select "Copy link").
-2. **Double-click `run.bat`**. The first time you open it, it will automatically install a small dependency called requests. Wait for about ten seconds.
+2. **Double-click `exe.`**. The first time you open it, it will automatically install a small dependency called requests. Wait for about ten seconds.
 3. The link is already filled in for you. **Simply click the big "Start Download" button**, and wait for the progress bar to complete.
 
 After downloading, a pop-up will ask, "Download complete! Do you want to open the folder?" Click "Yes" to directly view the file.
@@ -30,7 +30,7 @@ Files are saved by default in the **"Downloads"** folder on your computer, so yo
 
 All dependencies are packaged, so you can simply double-click to run.
 
-### Method 2: Double-click (recommended for general users)
+### Method 2: Double-click
 
 ```
 run.bat
@@ -229,7 +229,7 @@ A: A pop-up will appear only if the download is successful; failure will prompt 
 ## 一、小白三步使用法
 
 1. **复制下载链接**（在浏览器里对着下载地址点右键 → 复制链接）。
-2. **双击 `run.bat`**。第一次打开会自动装一个叫 requests 的小依赖，等十几秒就好。
+2. **双击 `exe.`**。
 3. 链接已经自动帮你填好了，**直接点那个大按钮“开始下载”**，等进度条走完就行。
 
 下载完成后会弹窗问“下载完成！是否打开所在文件夹？”，点“是”就直接带你看文件。
@@ -247,7 +247,7 @@ A: A pop-up will appear only if the download is successful; failure will prompt 
 ```
 
 已打包所有依赖库，双击即可运行
-### 方式 2：双击（推荐给普通用户）
+### 方式 2：双击
 
 ```
 run.bat
