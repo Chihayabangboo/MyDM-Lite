@@ -1,0 +1,4 @@
+# 开发/测试用依赖（普通用户不需要安装）
+# 安装：python -m pip install -r dev-requirements.txt
+-r requirements.txt
+pytest
