@@ -393,6 +393,12 @@ class DownloaderApp:
             self.status_var.set(message.get("status", ""))
             return
 
+        if kind == "resuming":
+            # 断点续传：只把状态标签的文本换成“正在恢复断点续传…”，
+            # 不动任何控件的创建 / 布局 / 尺寸。
+            self.status_var.set("正在恢复断点续传…")
+            return
+
         if kind == "progress":
             total = message.get("total") or 0
             downloaded = message.get("downloaded") or 0

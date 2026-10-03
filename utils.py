@@ -9,10 +9,12 @@
 * 默认“下载”目录获取（不存在就创建，创建失败回退用户主目录）
 * 跨平台“打开文件夹并选中文件”
 * 日志初始化（5MB 轮转，最多保留 3 个日志文件）
+* 断点续传元数据（``<文件名>.download.json``）的原子读写与校验
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import logging.handlers
 import os
@@ -20,8 +22,9 @@ import re
 import subprocess
 import sys
 import tempfile
+from datetime import datetime
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, List, Optional, Tuple
 from urllib.parse import unquote, urlparse
 
 # ---------------------------------------------------------------------------
@@ -72,6 +75,15 @@ __all__ = [
     "extract_first_url",
     "cleanup_part_files",
     "part_file_path",
+    "metadata_file_path",
+    "read_metadata",
+    "write_metadata",
+    "remove_metadata",
+    "build_metadata",
+    "inspect_part_files",
+    "has_resumable_state",
+    "load_resume_state",
+    "ResumeState",
     "setup_logging",
 ]
 
@@ -431,6 +443,277 @@ def cleanup_part_files(target, keep_indexes=None) -> int:
             # 文件被占用 / 没权限，静默跳过，不打断下载流程
             continue
     return removed
+
+
+# ---------------------------------------------------------------------------
+# 断点续传元数据（<文件名>.download.json）
+# ---------------------------------------------------------------------------
+#
+# 设计要点：
+# * 元数据只记“事实”：URL、总大小、分块布局、每个 .partN 的字节数、线程数、时间戳；
+#   恢复时真正信的是**磁盘上 .partN 的实际大小**，元数据只是对照表，
+#   所以即使某个 .partN 被截断也不影响正确性（缺多少补多少）。
+# * 写入必须是原子的（先写 .tmp 再 os.replace），否则程序中途挂掉会留下半截 JSON。
+# * 所有读取函数都“绝不抛异常”：元数据坏了就当成没有断点，从头下载，绝不让用户看到报错。
+
+
+METADATA_SUFFIX = ".download.json"
+METADATA_VERSION = 1
+
+# 合法分块区间的终点上限：任何 end 超过它的元数据都是坏的/是“大小未知”的占位值，
+# 一律拒绝续传（防止用哨兵值算出天文数字的区间长度）。
+MAX_CHUNK_END = 2 ** 62 - 1
+
+
+class ResumeState:
+    """一次“可以续传”的完整状态：元数据 + 每个 .partN 的有效字节数。
+
+    ``part_sizes`` 已经按分块区间裁剪过（不会超过该块应有的长度），
+    所以上层可以直接拿它当“已下载字节数”用。
+    """
+
+    __slots__ = ("metadata", "part_sizes", "chunks", "total_size", "url")
+
+    def __init__(self, metadata: dict, part_sizes: List[int], chunks: list,
+                 total_size: int, url: str):
+        self.metadata = metadata
+        self.part_sizes = part_sizes
+        self.chunks = chunks
+        self.total_size = int(total_size)
+        self.url = url or ""
+
+    @property
+    def downloaded_bytes(self) -> int:
+        """已经落盘的字节总数（恢复后进度条要从这里接着涨）。"""
+        return sum(self.part_sizes)
+
+    def completed_indexes(self) -> List[int]:
+        """已经下完的分块编号。"""
+        return [
+            int(chunk[0])
+            for chunk, size in zip(self.chunks, self.part_sizes)
+            if size >= int(chunk[2]) - int(chunk[1]) + 1
+        ]
+
+
+def metadata_file_path(target) -> Path:
+    """返回目标文件对应的元数据路径：``xxx.zip.download.json``。"""
+    target = Path(target)
+    return target.with_name(f"{target.name}{METADATA_SUFFIX}")
+
+
+def _now_text() -> str:
+    """本地时间字符串，写进元数据方便排查。"""
+    try:
+        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:  # pragma: no cover - 理论上不会失败
+        return ""
+
+
+def build_metadata(
+    url: str,
+    target,
+    total_size: Optional[int],
+    chunks,
+    part_sizes,
+    threads: int,
+    range_supported: bool = True,
+    final_url: str = "",
+) -> dict:
+    """组装一份元数据字典（纯函数，方便单测直接断言结构）。"""
+    target = Path(target)
+    layout = []
+    for chunk, size in zip(chunks, part_sizes):
+        index, start, end = (int(chunk[0]), int(chunk[1]), int(chunk[2]))
+        expected = end - start + 1
+        downloaded = max(0, min(int(size), expected))
+        layout.append({
+            "index": index,
+            "start": start,
+            "end": end,
+            "expected": expected,
+            "downloaded": downloaded,
+            "file": part_file_path(target, index).name,
+            "done": downloaded >= expected,
+        })
+
+    return {
+        "version": METADATA_VERSION,
+        "url": url or "",
+        "final_url": final_url or "",
+        "target": target.name,
+        "total_size": int(total_size) if total_size else None,
+        "range_supported": bool(range_supported),
+        "threads": max(1, int(threads)),
+        "chunks": layout,
+        "created_at": _now_text(),
+        "updated_at": _now_text(),
+    }
+
+
+def write_metadata(target, metadata: dict) -> Optional[Path]:
+    """原子写元数据：先写同名 ``.tmp`` 再 ``os.replace`` 覆盖。
+
+    写失败（没权限 / 磁盘满）只返回 None，绝不打断下载主流程——
+    丢一次检查点最多是下次少续一点，不能让整个下载失败。
+    """
+    path = metadata_file_path(target)
+    payload = dict(metadata or {})
+    payload.setdefault("version", METADATA_VERSION)
+    payload["updated_at"] = _now_text()
+
+    temp_path = path.with_name(path.name + ".tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        text = json.dumps(payload, ensure_ascii=False, indent=2)
+        with open(temp_path, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            try:
+                os.fsync(handle.fileno())
+            except Exception:  # pragma: no cover - 某些文件系统不支持
+                pass
+        os.replace(temp_path, path)
+        return path
+    except Exception:
+        # 清掉可能留下的半截临时文件，然后静默失败
+        try:
+            if temp_path.exists():
+                temp_path.unlink()
+        except Exception:
+            pass
+        return None
+
+
+def read_metadata(target) -> Optional[dict]:
+    """读取元数据；不存在 / 损坏 / 不是 JSON 对象时返回 None（当成没有断点）。"""
+    path = metadata_file_path(target)
+    try:
+        if not path.is_file():
+            return None
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    chunks = data.get("chunks")
+    if not isinstance(chunks, list) or not chunks:
+        return None
+    return data
+
+
+def remove_metadata(target) -> bool:
+    """删除元数据文件（合并成功后调用），顺便清掉可能的 .tmp 残留。"""
+    removed = False
+    path = metadata_file_path(target)
+    for candidate in (path, path.with_name(path.name + ".tmp")):
+        try:
+            if candidate.exists():
+                candidate.unlink()
+                removed = True
+        except Exception:
+            # 文件被占用也不能影响“下载已完成”这个结果
+            continue
+    return removed
+
+
+def inspect_part_files(target, chunks) -> List[int]:
+    """读取每个 ``.partN`` 的实际大小，并按该块应有的长度裁剪。
+
+    返回 ``[第0块已下载字节, 第1块已下载字节, ...]``；
+    文件不存在算 0，超大（磁盘上有脏数据）也算“该块已满”，交给大小校验去发现。
+    """
+    target = Path(target)
+    sizes: List[int] = []
+    for chunk in chunks:
+        index = int(chunk[0])
+        expected = int(chunk[2]) - int(chunk[1]) + 1
+        part = part_file_path(target, index)
+        try:
+            actual = part.stat().st_size if part.is_file() else 0
+        except Exception:
+            actual = 0
+        sizes.append(max(0, min(int(actual), expected)))
+    return sizes
+
+
+def has_resumable_state(target) -> bool:
+    """是否存在断点：元数据存在 **且** 至少有一个 .partN 还在。
+
+    只有元数据、没有分块文件时不算断点（那种情况直接按新下载处理更干净）。
+    """
+    if read_metadata(target) is None:
+        return False
+    target = Path(target)
+    try:
+        for entry in target.parent.iterdir():
+            if entry.is_file() and entry.name.startswith(target.name + ".part"):
+                suffix = entry.name[len(target.name):]
+                if _PART_SUFFIX_RE.match(suffix):
+                    return True
+    except Exception:
+        return False
+    return False
+
+
+def load_resume_state(target, url: Optional[str] = None) -> Optional[ResumeState]:
+    """读取并校验断点状态，不能续传时返回 None。
+
+    校验规则（任何一条不满足就放弃断点，让上层从头下载）：
+    * 元数据存在且分块布局合法（连续、不重叠、有 index/start/end）
+    * 元数据里的 URL 跟本次要下载的 URL 一致（换链接了就不能混用旧分块）
+    * 服务器支持 Range（不支持则断点续传没有意义）
+    """
+    target = Path(target)
+    metadata = read_metadata(target)
+    if metadata is None:
+        return None
+
+    saved_url = str(metadata.get("url") or "")
+    if url and saved_url and saved_url != url:
+        return None
+
+    if not metadata.get("range_supported", True):
+        return None
+
+    raw_chunks = metadata.get("chunks") or []
+    chunks: List[Tuple[int, int, int]] = []
+    for item in raw_chunks:
+        if not isinstance(item, dict):
+            return None
+        try:
+            index = int(item.get("index"))
+            start = int(item.get("start"))
+            end = int(item.get("end"))
+        except (TypeError, ValueError):
+            return None
+        if index < 0 or start < 0 or end < start:
+            return None
+        if end > MAX_CHUNK_END:
+            return None
+        chunks.append((index, start, end))
+    if not chunks:
+        return None
+    # 分块必须连续、不重叠、从 0 开始（元数据被改坏的话宁可不续传）
+    for position, (index, start, end) in enumerate(chunks):
+        if index != position:
+            return None
+        if position and start != chunks[position - 1][2] + 1:
+            return None
+    if chunks[0][1] != 0:
+        return None
+
+    raw_total = metadata.get("total_size")
+    try:
+        total_size = int(raw_total)
+    except (TypeError, ValueError):
+        return None
+    if total_size <= 0 or total_size > MAX_CHUNK_END or chunks[-1][2] != total_size - 1:
+        return None
+
+    part_sizes = inspect_part_files(target, chunks)
+    return ResumeState(metadata, part_sizes, chunks, total_size, saved_url)
 
 
 # ---------------------------------------------------------------------------

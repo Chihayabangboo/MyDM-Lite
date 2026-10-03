@@ -186,7 +186,6 @@ pyinstaller --noconfirm --clean --onefile --windowed --name MyDM-Lite main.py
 
 ## Eight, Known Limitations (intentionally kept simple)
 
-* **No breakpoint resume**: Restarting the program will require a full download.
 * **Single task**: Only one file can be downloaded at a time, no queue.
 * **Cannot limit speed, cannot set proxy**: Not implemented.
 * **No system tray icon, no browser extension**.
@@ -403,7 +402,6 @@ pyinstaller --noconfirm --clean --onefile --windowed --name MyDM-Lite main.py
 
 ## 八、已知限制（刻意保持简单）
 
-* **不支持断点续传**：关掉程序再打开，要从头下。
 * **单任务**：同一时间只能下一个文件，没有队列。
 * **不能限速、不能设代理**：没做。
 * **没有托盘图标、没有浏览器扩展**。

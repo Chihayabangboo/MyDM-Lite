@@ -5,8 +5,9 @@
 * 按自动调整规则算线程数，把文件切成若干字节区间
 * 每个线程写**自己的** ``.partN`` 临时文件（绝不 seek 写同一个文件）
 * 每个线程独立负责自己区间的重试（429 指数退避 / 连接超时 / 5xx）
-* 全部下载完成后按顺序合并成最终文件，并删除所有 ``.partN``
-* 取消（threading.Event）时立刻停止并清理临时文件
+* **断点续传**：把进度写进 ``<文件名>.download.json``，下次接着下
+* 全部下载完成后按顺序合并成最终文件，并删除所有 ``.partN`` 和元数据
+* 取消（threading.Event）时立刻停止，**保留**分块和元数据以便下次继续
 
 给界面用的时候只需要：``download(url, target, threads, cancel_event, progress_cb)``。
 所有面向用户的错误都是 ``DownloadError``，``message`` 是通俗中文。
@@ -24,13 +25,20 @@ from typing import Callable, List, Optional, Sequence, Tuple
 import requests
 
 from utils import (
+    build_metadata,
     cleanup_part_files,
     ensure_dir,
     format_eta,
     get_logger,
+    has_resumable_state,
+    inspect_part_files,
+    load_resume_state,
+    metadata_file_path,
     part_file_path,
+    remove_metadata,
     resolve_download_filename,
     unique_path,
+    write_metadata,
 )
 
 # ---------------------------------------------------------------------------
@@ -55,6 +63,15 @@ MAX_RETRY_429 = 3  # 429 限流：最多重试 3 次，指数退避
 MAX_RETRY_TRANSIENT = 2  # 连接超时 / 5xx：最多重试 2 次
 MAX_RETRY_OTHER = 1  # 其它网络异常（数据不全等）：最多重试 1 次
 
+# ---- 断点续传检查点：主线程写入节奏
+CHECKPOINT_INTERVAL = 1.0  # 至少每 1 秒写一次元数据
+CHECKPOINT_BYTES = 1024 * 1024  # 或者每多下载 1MB 写一次（先到哪个算哪个）
+CHECKPOINT_POLL = 0.1  # 主线程轮询进度的时间粒度
+
+# 服务器没给文件大小时用的“区间终点”：表示一直读到连接结束。
+# 单线程时不会发 Range 头，这个值只是让区间长度计算不至于变成 1 字节。
+UNKNOWN_END = 2 ** 62
+
 # 面向用户的通俗中文提示
 MSG_NETWORK_FAILED = "网络连接失败，请检查网络后重试"
 MSG_FORBIDDEN = "服务器拒绝访问，请检查链接或稍后再试"
@@ -65,6 +82,10 @@ MSG_SAVE_FAILED = "保存失败，请检查磁盘空间或换个保存位置"
 MSG_INCOMPLETE = "下载不完整，请检查网络后重试"
 MSG_CANCELLED = "已取消"
 MSG_UNKNOWN = "下载失败，请稍后重试"
+
+# 断点续传相关的状态文案（界面直接显示）
+MSG_RESUME_STATUS = "正在恢复断点续传…"
+MSG_NO_RANGE_DOWNGRADE = "服务器不支持断点续传，已清空临时文件重新下载"
 
 _LOG = get_logger("mydm.downloader")
 
@@ -173,6 +194,55 @@ def plan_chunks(total_size: int, threads: int) -> List[Tuple[int, int, int]]:
             end = start + base - 1
         chunks.append((index, start, end))
         start = end + 1
+    return chunks
+
+
+def plan_chunks_resume(
+    chunks: Sequence[Tuple[int, int, int]], part_sizes: Sequence[int]
+) -> List[dict]:
+    """把“分块布局 + 每个 ``.partN`` 已有字节数”换算成续传计划。
+
+    对每一块给出三件事：
+
+    * ``resume_bytes``：磁盘上已有多少字节（**这就是要跳过的字节数**）
+    * ``fetch_start``：本次请求 Range 的起点 = ``原始起点 + resume_bytes``
+    * ``complete``：这一块是否已经下完（下完就整块跳过，一个字节都不请求）
+
+    纯函数，不碰磁盘不碰网络，方便单测直接验算区间。
+    """
+    plan: List[dict] = []
+    for position, chunk in enumerate(chunks):
+        index, start, end = int(chunk[0]), int(chunk[1]), int(chunk[2])
+        expected = end - start + 1
+        try:
+            existing = int(part_sizes[position]) if position < len(part_sizes) else 0
+        except (TypeError, ValueError):
+            existing = 0
+        # 已有字节不可能超过这一块的长度（脏数据一律按“下满了”处理，交给校验兜底）
+        existing = max(0, min(existing, expected))
+        plan.append({
+            "index": index,
+            "start": start,
+            "end": end,
+            "expected": expected,
+            "resume_bytes": existing,
+            "fetch_start": start + existing,
+            "complete": existing >= expected,
+        })
+    return plan
+
+
+def _chunks_from_plan(plan: Sequence) -> List[Tuple[int, int, int]]:
+    """从续传计划里取回分块布局（方便复用 merge / 元数据那套逻辑）。
+
+    兼容两种输入：``(index, start, end)`` 元组，或者元数据里带 index/start/end 的字典。
+    """
+    chunks: List[Tuple[int, int, int]] = []
+    for item in plan:
+        if isinstance(item, dict):
+            chunks.append((int(item["index"]), int(item["start"]), int(item["end"])))
+        else:
+            chunks.append((int(item[0]), int(item[1]), int(item[2])))
     return chunks
 
 
@@ -476,27 +546,76 @@ def download_range(
     cancel_event: Optional[threading.Event],
     single: bool = False,
     progress_cb: Optional[Callable[[int], None]] = None,
+    resume_from: int = 0,
+    total_size: Optional[int] = None,
 ) -> int:
     """把 ``[start, end]`` 这段字节下载到 ``part_path``。
 
-    重试完全由本函数负责（就是“每个线程负责自己那一段”），每次重试都会
-    清空分块文件重新下载，不做 Range 续写，简单可靠。
-    ``expected_size`` 为 None 表示服务器没给文件大小，这时只要求“读到多少算多少”。
-    返回实际写入的字节数；用户取消抛 ``DownloadCancelled``，失败抛 ``DownloadError``。
+    重试完全由本函数负责（就是“每个线程负责自己那一段”）。
+    返回值是**这一块最终落盘的完整字节数**（含续传前已有的部分）。
+
+    断点续传参数：
+
+    * ``resume_from``：这块磁盘上已经有多少字节，本次只请求剩下的 ``Range``；
+      传 0 就是从头下载（并且会把分块文件清空重写）。
+    * ``total_size``：整个文件的大小，只在 ``single=True`` 的续传场景用来识别
+      “服务器忽略了 Range、返回 200 全量”，从而退回从头下载避免拼出脏数据。
+
+    其它约定：
+    * 续传时如果失败，**保留已经落盘的字节**，下次还能接着续（这是续传的意义）；
+      从头下载（``resume_from == 0``）失败时同样保留，方便上层下次建立断点。
+    * 用户取消抛 ``DownloadCancelled``，失败抛 ``DownloadError``。
     """
     part_path = Path(part_path)
+    target_length = int(end) - int(start) + 1
+    finish = int(end)
     attempt_429 = 0
     attempt_transient = 0
     attempt_other = 0
     last_detail = ""
 
+    try:
+        resume_point = int(resume_from)
+    except (TypeError, ValueError):
+        resume_point = 0
+    # 脏数据保护：磁盘上已有的字节数不可能超过这一块的长度
+    resume_point = max(0, min(resume_point, target_length))
+    # 已经完整了就一个字节都不用下
+    if resume_point >= target_length:
+        return target_length
+
+    def part_bytes_on_disk() -> int:
+        """分块文件在磁盘上的真实大小（被裁剪到区间长度）。"""
+        try:
+            size = part_path.stat().st_size if part_path.exists() else 0
+        except OSError:
+            size = 0
+        return max(0, min(int(size), target_length))
+
     while True:
         if cancel_event is not None and cancel_event.is_set():
             raise DownloadCancelled()
 
-        written = 0
+        # 本次要从哪里接着写：
+        # * resume_from == 0 → 调用方要求从头下载这一块，磁盘上的残留一律作废（必须重写）
+        # * resume_from > 0  → 按磁盘实际已有的字节数接着写（磁盘比声称的短就以磁盘为准，
+        #   短的部分会在下面按实际起点重新请求 Range 补回来）
+        if resume_point <= 0:
+            written_before = 0
+        else:
+            written_before = min(part_bytes_on_disk(), target_length)
+        fetch_start = int(start) + written_before
+        if fetch_start > finish:
+            return target_length
+
+        appended = 0
+        # 磁盘上已有 N 字节就必须用 "rb+" 定位到第 N 字节续写，
+        # 用 "wb" 会把已经下好的 N 字节截断重来（等于白下）。
+        mode = "rb+" if written_before else "wb"
         try:
-            response = _open_response(session, url, start, end, single)
+            # 单线程从头下载时不发 Range（兼容完全不支持 Range 的服务器）
+            use_single = bool(single and written_before <= 0)
+            response = _open_response(session, url, fetch_start, finish, use_single)
             try:
                 status = response.status_code
                 if status == 403:
@@ -508,15 +627,42 @@ def download_range(
                         retryable=status == 429 or 500 <= status <= 599,
                     )
 
-                # 重试时清空分块文件，从头写这一区间
-                with open(part_path, "wb") as handle:
+                if status == 206 and not _content_range_matches(
+                    response.headers.get("Content-Range"), fetch_start
+                ):
+                    # 服务器返回的区间起点不是我们要的，绝不能往文件里追加
+                    raise DownloadError(
+                        MSG_INCOMPLETE,
+                        f"服务器返回了错误的区间（{part_path.name}）",
+                    )
+
+                if status == 200 and written_before > 0:
+                    # 带了 Range 却拿到 200：服务器把整个文件返回了。
+                    # 追加会拼出脏数据，所以退回“这一块从头下载”。
+                    _LOG.info("分块 %s 的续传请求返回 200，改为从头下载这一块", part_path.name)
+                    if single and total_size and int(total_size) > target_length:
+                        raise DownloadError(
+                            MSG_INCOMPLETE,
+                            f"服务器不支持断点续传（{part_path.name}）",
+                            retryable=False,
+                        )
+                    written_before = 0
+                    appended = 0
+                    mode = "wb"
+
+                with open(part_path, mode) as handle:
+                    if mode == "rb+":
+                        # 先定位再截断：磁盘上如果多出了脏字节（上次写坏/被别的程序改过），
+                        # 必须砍掉，否则合并出来就是坏文件。
+                        handle.seek(written_before)
+                        handle.truncate()
                     for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
                         if cancel_event is not None and cancel_event.is_set():
                             raise DownloadCancelled()
                         if not chunk:
                             continue
                         handle.write(chunk)
-                        written += len(chunk)
+                        appended += len(chunk)
                         if progress_cb is not None:
                             progress_cb(len(chunk))
             finally:
@@ -525,14 +671,17 @@ def download_range(
                 except Exception:
                     pass
 
-            if expected_size is not None and written != expected_size:
+            # 大小校验：expected_size 为 None 表示服务器没给大小（读到多少算多少），
+            # 这时绝不能拿“区间长度”去要求字节数——大小未知时区间终点是无限大。
+            if expected_size is not None and written_before + appended != int(expected_size):
                 raise DownloadError(
                     MSG_INCOMPLETE,
-                    f"分块字节数不符：期望 {expected_size}，实际 {written}",
+                    f"分块字节数不符：期望 {expected_size}，实际 {written_before + appended}",
                 )
-            return written
+            return written_before + appended
 
         except DownloadCancelled:
+            # 取消时保留已经落盘的字节，下次接着续
             raise
         except DownloadError as exc:
             if not exc.retryable:
@@ -577,6 +726,23 @@ def download_range(
             raise DownloadError(MSG_SAVE_FAILED, f"{type(exc).__name__}: {exc}", retryable=False) from exc
 
 
+def _content_range_matches(header: Optional[str], expected_start: int) -> bool:
+    """校验 206 响应的 ``Content-Range`` 起点是否为 ``expected_start``。
+
+    没有这个头或者解析不出来时返回 True（有些服务器不返回它，不该因此判失败）。
+    """
+    if not header:
+        return True
+    match = re.search(r"bytes\s+(\d+)\s*-", str(header), re.IGNORECASE)
+    if not match:
+        return True
+    try:
+        return int(match.group(1)) == int(expected_start)
+    except (TypeError, ValueError):  # pragma: no cover - 正则已保证是数字
+        return True
+
+
+
 def _status_from_detail(detail: str) -> Optional[int]:
     """从 detail 里把 HTTP 状态码抠出来（detail 形如 ``HTTP 429 (...)``）。"""
     if not detail:
@@ -605,8 +771,14 @@ def _worker(
     errors: List[BaseException],
     status_text: str,
     error_lock: threading.Lock,
+    start_offset: int = 0,
+    total_size: Optional[int] = None,
 ) -> None:
-    """一个分块线程：下载自己的区间 → 更新全局进度 → 出错记录异常。"""
+    """一个分块线程：下载自己的区间（可续传）→ 更新全局进度 → 出错记录异常。
+
+    ``start_offset`` 是这块在磁盘上已经有的字节数（续传时跳过它们），
+    非 0 表示这是恢复的那一块，下完要通知界面一次“正在恢复断点续传…”。
+    """
     index, start, end = chunk
     part_path = part_file_path(target, index)
 
@@ -620,8 +792,16 @@ def _worker(
         download_range(
             session=session, url=url, part_path=part_path, start=start, end=end,
             expected_size=expected_size, cancel_event=cancel_event, single=single,
-            progress_cb=on_bytes,
+            progress_cb=on_bytes, resume_from=start_offset, total_size=total_size,
         )
+        if start_offset > 0:
+            # 通知界面：这一块是接着上次下的。main.py 只会把状态标签改个字，
+            # 不涉及任何控件创建/布局改动。
+            progress_cb({
+                "type": "resuming",
+                "status": MSG_RESUME_STATUS,
+                "resumed_bytes": int(start_offset),
+            })
         message = reporter.report(force=True, status=status_text)
         if message is not None:
             progress_cb(message)
@@ -639,6 +819,8 @@ def merge_parts(target: Path, chunks: Sequence[Tuple[int, int, int]], expected_t
     """按顺序把 ``.partN`` 合并成最终文件，返回合并后的字节数。
 
     合并成功后删除所有 ``.partN``；合并失败也会尽量清理。
+    元数据（``.download.json``）由调用方在合并成功后删除——
+    这里保留它，万一合并中途失败，下次还能接着续。
     """
     target = Path(target)
     total_written = 0
@@ -687,12 +869,21 @@ def download(
     session=None,
     logger=None,
     max_threads: int = MAX_THREADS,
+    resume: bool = True,
 ) -> Path:
     """下载 ``url`` 到 ``target``，返回最终文件路径。
 
     ``progress_cb`` 会被**下载线程**调用，参数是要发给主线程的 dict 消息，
-    可能包含：``type=progress`` / ``type=status``。界面层只负责塞进 queue，
-    绝不在子线程里碰 Tkinter 控件。
+    可能包含：``type=progress`` / ``type=status`` / ``type=resuming``。
+    界面层只负责塞进 queue，绝不在子线程里碰 Tkinter 控件。
+
+    ``resume=True``（默认）时启用断点续传：
+
+    * 发现 ``<文件名>.download.json`` + ``.partN`` 就接着下，只请求缺的那段 Range；
+    * 下载中主线程每 1 秒或每 1MB 写一次元数据（线程安全，原子替换）；
+    * 服务器明确不支持 Range → 清掉临时文件和元数据，退回单线程从头下载；
+    * 合并成功 → 删除元数据 + 所有 ``.partN``；
+    * 用户取消 → **保留**元数据和 ``.partN``，下次点开始就能继续。
     """
     log = logger or get_logger("mydm.downloader")
     cancel_event = cancel_event or threading.Event()
@@ -701,11 +892,13 @@ def download(
         progress_cb = lambda _msg: None  # noqa: E731
 
     ensure_dir(target.parent)
-    # 开始前先清理同名残留，避免旧数据混进来
-    cleanup_part_files(target)
 
     own_session = session is None
     session = session or make_session()
+
+    # 是否已经建立了本次下载的断点（决定取消时是保留还是清理临时文件）
+    checkpoint_started = False
+    completed = False
 
     try:
         if cancel_event.is_set():
@@ -727,67 +920,144 @@ def download(
         if actual_threads != requested:
             _emit_status(progress_cb, f"已自动调整为 {actual_threads} 线程")
             log.info("线程数自动调整：%s → %s", requested, actual_threads)
-        else:
-            _emit_status(progress_cb, f"开始下载（{actual_threads} 线程）")
 
         # 没有 content-length 时按单线程处理，并把期望大小置空
         if content_length is None or content_length <= 0:
             content_length = None
             actual_threads = 1
 
-        if content_length is None:
-            chunks = [(0, 0, 0)]
-            single = True
+        # ---- 断点续传：能续就续，不能续（含服务器不支持 Range）就清掉重来
+        chunks: List[Tuple[int, int, int]] = []
+        part_sizes: List[int] = []
+        resume_state = None
+        if resume and content_length:
+            if not range_supported and has_resumable_state(target):
+                # 需求红线：服务器不支持 Accept-Ranges 时强制放弃续传，
+                # 清空临时文件和元数据，退回单线程从头下载。
+                log.info("服务器不支持 Range，放弃断点续传并清空临时文件：%s", target)
+                _emit_status(progress_cb, MSG_NO_RANGE_DOWNGRADE)
+                cleanup_part_files(target)
+                remove_metadata(target)
+                actual_threads = 1
+            elif range_supported:
+                resume_state = load_resume_state(target, url=url)
+
+        if resume_state is not None:
+            chunks = _chunks_from_plan(resume_state.chunks)
+            part_sizes = list(resume_state.part_sizes)
+            actual_threads = len(chunks)
+            done_before = resume_state.downloaded_bytes
+            log.info("发现断点：已下载 %s 字节 / 共 %s 字节，分块 %s 个，接着下",
+                     done_before, content_length, len(chunks))
+            _emit_status(
+                progress_cb,
+                f"{MSG_RESUME_STATUS}（已完成 {done_before * 100 // max(1, content_length)}%）",
+            )
         else:
-            chunks = plan_chunks(content_length, actual_threads)
-            single = len(chunks) <= 1
+            if not chunks:
+                if content_length is None:
+                    chunks = [(0, 0, UNKNOWN_END)]
+                else:
+                    chunks = plan_chunks(content_length, actual_threads)
+            # 新下载：清掉同名残留（没有元数据的 .partN 无法校验，不能混进来）
+            cleanup_part_files(target)
+            part_sizes = inspect_part_files(target, chunks)
+            if content_length is None:
+                _emit_status(progress_cb, "开始下载（1 线程）")
+            elif actual_threads == requested:
+                _emit_status(progress_cb, f"开始下载（{actual_threads} 线程）")
+
+        single = len(chunks) <= 1
+        if content_length is None:
+            # 大小未知：只有一个 [0, ∞) 区间，没有区间信息可以拿去算续传，
+            # 也不能按“区间长度 = end - start + 1”去校验字节数（那会算成 1 字节）。
+            resume_plan = [{
+                "index": 0, "start": 0, "end": UNKNOWN_END,
+                "expected": None, "resume_bytes": 0, "fetch_start": 0, "complete": False,
+            }]
+        else:
+            resume_plan = plan_chunks_resume(chunks, part_sizes)
 
         reporter = ProgressReporter(content_length)
+        if resume_state is not None:
+            # 续传时进度基数 = 磁盘上已经有的字节，进度条才不会从 0 重新跳
+            reporter.add(resume_state.downloaded_bytes)
         canceled = threading.Event()
         errors: List[BaseException] = []
         error_lock = threading.Lock()
         status_text = f"正在下载（{len(chunks)} 线程）"
+        resumed_any = any(item["resume_bytes"] > 0 for item in resume_plan)
 
-        # 单线程时让它用带 Range 的头也无所谓；但为了兼容不支持 Range 的服务器，
-        # single=True 时不发 Range 头，直接下整个文件。
+        # ---- 建立/更新元数据：合并前它一直待在磁盘上，中断了下次接着用
+        metadata = build_metadata(
+            url=url, target=target, total_size=content_length, chunks=chunks,
+            part_sizes=part_sizes, threads=len(chunks), range_supported=range_supported,
+            final_url=probe.final_url,
+        )
+        if write_metadata(target, metadata) is not None:
+            checkpoint_started = True
+        else:
+            log.warning("元数据写入失败，本次下载不做断点续传：%s", target)
+
         worker_threads = []
-        for chunk in chunks:
+        for item in resume_plan:
+            chunk = (item["index"], item["start"], item["end"])
+            expected = None if content_length is None else item["expected"]
             worker = threading.Thread(
                 target=_worker,
                 kwargs=dict(
                     session=session, url=url, target=target, chunk=chunk,
-                    expected_size=(None if content_length is None else chunk[2] - chunk[1] + 1),
-                    cancel_event=cancel_event, single=single, reporter=reporter,
-                    progress_cb=progress_cb, errors=errors, status_text=status_text,
-                    error_lock=error_lock,
+                    expected_size=expected, cancel_event=cancel_event, single=single,
+                    reporter=reporter, progress_cb=progress_cb, errors=errors,
+                    status_text=status_text, error_lock=error_lock,
+                    start_offset=item["resume_bytes"],
+                    total_size=content_length,
                 ),
-                name=f"mydm-part{chunk[0]}",
+                name=f"mydm-part{item['index']}",
                 daemon=True,
             )
             worker.start()
             worker_threads.append(worker)
 
-        # 等待全部线程结束（取消时事件会被置位，线程会自己退出）
+        # ---- 主线程等待 + 定时写检查点（元数据只由主线程写，天然线程安全）
+        last_checkpoint_at = time.monotonic()
+        last_checkpoint_bytes = reporter.downloaded
         for worker in worker_threads:
             while worker.is_alive():
-                worker.join(timeout=0.2)
+                worker.join(timeout=CHECKPOINT_POLL)
                 if cancel_event.is_set():
                     canceled.set()
+                now = time.monotonic()
+                if (now - last_checkpoint_at) >= CHECKPOINT_INTERVAL or \
+                        (reporter.downloaded - last_checkpoint_bytes) >= CHECKPOINT_BYTES:
+                    _update_checkpoint(target, metadata, reporter.downloaded)
+                    last_checkpoint_at = now
+                    last_checkpoint_bytes = reporter.downloaded
 
         # 有线程报错时，错误信息优先于“已取消”
         with error_lock:
             first_error = errors[0] if errors else None
         if first_error is not None:
+            # 出错也要把现场存下来，用户再点一次“开始下载”还能接着续
+            _update_checkpoint(target, metadata, reporter.downloaded)
             if isinstance(first_error, DownloadError):
                 raise first_error
             raise DownloadError(MSG_UNKNOWN, f"{type(first_error).__name__}: {first_error}")
 
         if cancel_event.is_set() or canceled.is_set():
+            _update_checkpoint(target, metadata, reporter.downloaded)
             raise DownloadCancelled()
 
         actual_total = reporter.downloaded
         if content_length is None:
             content_length = actual_total
+        elif actual_total != content_length:
+            # 分块加起来不等于总大小：说明磁盘上有脏分块，合并出来一定是坏文件。
+            # 这里直接报中文错并清理现场，绝不让用户拿到一个“看起来成功”的坏文件。
+            raise DownloadError(
+                MSG_INCOMPLETE,
+                f"分块总字节数不符：期望 {content_length}，实际 {actual_total}",
+            )
 
         # ---- 合并阶段：通知界面“正在合并文件…”，界面会禁用开始/取消按钮
         progress_cb({"type": "merging", "status": "正在合并文件…", "downloaded": actual_total,
@@ -795,7 +1065,9 @@ def download(
         log.info("开始合并 %s 个分块 → %s", len(chunks), target.name)
         merged = merge_parts(target, chunks, content_length if content_length else None)
         cleanup_part_files(target)
-        log.info("下载完成：%s（%s 字节）", target, merged)
+        remove_metadata(target)
+        completed = True
+        log.info("下载完成：%s（%s 字节）%s", target, merged, "（断点续传）" if resumed_any else "")
 
         progress_cb({
             "type": "done", "status": "已完成", "path": str(target),
@@ -805,15 +1077,25 @@ def download(
         return target
 
     except DownloadCancelled:
-        cleanup_part_files(target)
-        log.info("用户取消下载，已清理临时分块：%s", target)
+        if checkpoint_started:
+            # 用户主动取消：保留 .partN 和元数据，下次点“开始下载”直接接着续
+            log.info("用户取消下载，已保留断点（%s 个分块 + 元数据）：%s",
+                     len(_safe_chunks(chunks)), target)
+        else:
+            cleanup_part_files(target)
+            log.info("用户取消下载，已清理临时分块：%s", target)
         raise
     except DownloadError as exc:
-        cleanup_part_files(target)
-        log.error("下载失败：%s（%s）", exc.message, exc.detail)
+        if checkpoint_started:
+            log.error("下载失败：%s（%s）；已保留断点供下次续传", exc.message, exc.detail)
+        else:
+            cleanup_part_files(target)
+            log.error("下载失败：%s（%s）", exc.message, exc.detail)
         raise
     except Exception as exc:  # noqa: BLE001 - 兜底，绝不让英文堆栈冒到界面上
-        cleanup_part_files(target)
+        if not checkpoint_started or not completed:
+            cleanup_part_files(target)
+            remove_metadata(target)
         log.exception("下载出现未预期错误：%s", exc)
         raise DownloadError(MSG_UNKNOWN, f"{type(exc).__name__}: {exc}") from exc
     finally:
@@ -822,6 +1104,41 @@ def download(
                 session.close()
             except Exception:
                 pass
+
+
+def _safe_chunks(value) -> list:
+    """给日志用：确认 ``chunks`` 是列表，避免日志本身再抛异常。"""
+    return value if isinstance(value, list) else []
+
+
+def _update_checkpoint(target: Path, metadata: Optional[dict], downloaded: int) -> None:
+    """按磁盘现状刷新元数据里的每个分块字节数，然后原子写盘。
+
+    只跟 ``.partN`` 的实际大小对齐（不猜），所以即使某个分块文件被截断，
+    恢复时也不会读多或读少。写失败只记日志，绝不影响下载。
+    """
+    if not metadata:
+        return
+    try:
+        chunks = [
+            (int(item["index"]), int(item["start"]), int(item["end"]))
+            for item in metadata.get("chunks", [])
+        ]
+        if not chunks:
+            return
+        sizes = inspect_part_files(target, chunks)
+        total = metadata.get("total_size")
+        metadata["bytes_downloaded"] = int(downloaded)
+        metadata["chunks"] = build_metadata(
+            url=str(metadata.get("url") or ""), target=target, total_size=total,
+            chunks=chunks, part_sizes=sizes,
+            threads=int(metadata.get("threads") or len(chunks)),
+            range_supported=bool(metadata.get("range_supported", True)),
+            final_url=str(metadata.get("final_url") or ""),
+        )["chunks"]
+        write_metadata(target, metadata)
+    except Exception as exc:  # noqa: BLE001 - 检查点永远不能拖垮下载
+        _LOG.warning("刷新断点元数据失败：%s", exc)
 
 
 def _emit_status(progress_cb: Callable[[dict], None], text: str) -> None:
@@ -846,9 +1163,12 @@ def download_to_directory(
     session=None,
     logger=None,
 ) -> Path:
-    """先探测文件名，再决定最终保存路径（自动处理重名），然后开始下载。
+    """先探测文件名，再决定最终保存路径，然后开始下载。
 
     界面里点“开始下载”走的就是这里。
+
+    断点续传的关键一步：如果同名文件旁边已经有 ``.download.json`` + ``.partN``，
+    就**沿用这个名字**（不再加 ``(1)`` 后缀），这样才是接着上次继续下。
     """
     log = logger or get_logger("mydm.downloader")
     cancel_event = cancel_event or threading.Event()
@@ -863,7 +1183,13 @@ def download_to_directory(
         filename = resolve_download_filename(
             url=probe.final_url or url, headers=probe.headers
         )
-        target = unique_path(directory / filename)
+        plain_target = directory / filename
+        if has_resumable_state(plain_target):
+            # 有断点 → 沿用原文件名，走到 download() 里自然会续传
+            target = plain_target
+            log.info("发现未完成的下载，继续使用原文件名：%s", target)
+        else:
+            target = unique_path(plain_target)
         log.info("解析文件名：%s → %s", filename, target)
         return download(
             url=url, target=target, threads=threads, cancel_event=cancel_event,
