@@ -33,7 +33,7 @@ from downloader import (
     plan_chunks,
     probe_server,
 )
-from utils import part_file_path
+from utils import metadata_file_path, part_file_path
 
 CJK_FILENAME = "中文文件名.bin"
 CJK_DISPOSITION = (
@@ -147,7 +147,8 @@ class _RangeRequestHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/octet-stream")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Accept-Ranges", "bytes" if self.config["support_range"] else "none")
-        if status == 206:
+        if status == 206 or end > start:
+            # 断点续传测试需要看真实下发的区间；200 表示服务器忽略了 Range
             self.send_header("Content-Range", f"bytes {start}-{end - 1}/{content_length}")
         disposition = self.config["content_disposition"]
         if disposition:
@@ -321,6 +322,25 @@ class RangeTestServer:
     @property
     def request_log(self):
         return list(self.stats["range_headers"])
+
+    def range_headers(self, exclude_probe: bool = True):
+        """所有下发过的 Range 头；``exclude_probe=True`` 时排除 ``bytes=0-0`` 探测。
+
+        断点续传测试用它验证“只请求了缺的那一段”。
+        """
+        headers = list(self.stats["range_headers"])
+        if exclude_probe:
+            headers = [value for value in headers if value != "bytes=0-0"]
+        return headers
+
+    def range_starts(self, exclude_probe: bool = True):
+        """解析出每个 Range 请求的起始偏移，方便断言续传跳过了多少字节。"""
+        starts = []
+        for value in self.range_headers(exclude_probe=exclude_probe):
+            match = RANGE_RE.search(value or "")
+            if match:
+                starts.append(int(match.group(1)))
+        return starts
 
 
 @pytest.fixture
@@ -802,8 +822,11 @@ def test_download_cleans_leftover_part_files_before_start(large_range_server, tm
     assert list(tmp_path.glob("*.part*")) == []
 
 
-def test_download_cancel_removes_all_part_files(tmp_path):
-    """取消下载后，所有 .partN 必须被清理。"""
+def test_download_cancel_keeps_parts_for_resume(tmp_path):
+    """取消下载后必须**保留** .partN 和元数据，下次才能断点续传。
+
+    （旧行为是取消即清理；加入断点续传后契约变成“取消 = 保留断点”。）
+    """
     server = RangeTestServer(payload=build_payload(2 * 1024 * 1024), delay=2.0)
     target = tmp_path / "slow.bin"
     cancel_event = threading.Event()
@@ -822,13 +845,18 @@ def test_download_cancel_removes_all_part_files(tmp_path):
     try:
         worker = threading.Thread(target=run_download, name="cancel-test", daemon=True)
         worker.start()
-        time.sleep(0.6)
+        # 等断点建立（元数据落盘）后再取消，确保测的是“保留断点”而不是“还没开始”
+        for _ in range(200):
+            if metadata_file_path(target).exists():
+                break
+            time.sleep(0.02)
         cancel_event.set()
         worker.join(timeout=10)
         assert not worker.is_alive(), "取消后下载线程必须很快结束"
         assert captured and isinstance(captured[0], DownloadCancelled), captured
-        assert not target.exists()
-        assert list(tmp_path.glob("*.part*")) == [], "取消后必须清理所有分块文件"
+        assert not target.exists(), "取消后不应该留下半成品文件"
+        assert metadata_file_path(target).exists(), "取消后必须保留元数据"
+        assert list(tmp_path.glob("*.part*")) != [], "取消后必须保留分块文件"
     finally:
         server.stop()
 
