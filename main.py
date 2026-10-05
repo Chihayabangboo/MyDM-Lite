@@ -26,11 +26,16 @@ from downloader import (
     download_to_directory,
 )
 from utils import (
+    CONFIG_KEY_LAST_SAVE_DIR,
     extract_first_url,
     format_eta,
     format_size,
     get_default_download_dir,
+    is_usable_save_dir,
+    load_config,
+    resolve_save_dir,
     reveal_in_folder,
+    save_config,
     setup_logging,
 )
 
@@ -59,7 +64,11 @@ class DownloaderApp:
         self.downloading = False
         self.merging = False
         self.default_dir = get_default_download_dir()
-        self.save_dir = self.default_dir
+        # 记忆上次保存路径：读配置**失败/损坏/路径不可用**都静默回退默认下载目录。
+        # 只影响 self.save_dir 的取值（也就是已有“保存到”输入框里的文本），
+        # 不新建、不移动、不改变任何控件的布局 / 尺寸 / 位置。
+        self.config = load_config()
+        self.save_dir = self._resolve_startup_save_dir()
         self._poll_job = None
 
         self.url_var = tk.StringVar(value="")
@@ -76,6 +85,45 @@ class DownloaderApp:
         self.root.after(150, self._check_clipboard)
         self._schedule_poll()
         self.log.info("程序启动，默认保存目录：%s", self.save_dir)
+
+    # ------------------------------------------------------------------
+    # 配置（记忆上次保存路径）
+    # ------------------------------------------------------------------
+
+    def _resolve_startup_save_dir(self) -> Path:
+        """启动时决定“保存到”用什么目录：上次的（有效且可写）→ 否则默认下载目录。
+
+        只读配置 + 校验，绝不弹窗、绝不抛异常；回退逻辑完全复用 utils
+        （``resolve_save_dir`` 内部就是 ``get_default_download_dir``）。
+        """
+        try:
+            directory = resolve_save_dir(self.config, default=self.default_dir)
+        except Exception as exc:  # noqa: BLE001 - 配置问题绝不能拦住程序启动
+            self.log.warning("读取上次保存路径失败，改用默认下载目录：%s", exc)
+            return self.default_dir
+        if not is_usable_save_dir(directory):
+            return self.default_dir
+        return directory
+
+    def _remember_save_dir(self, directory=None) -> bool:
+        """把当前保存目录写进配置文件（原子写入），返回是否写成功。
+
+        只有**下载任务成功启动后**（监听到 ``state=probed``）才会被调用；
+        写失败只记一行日志，绝不影响下载，也绝不弹窗。
+        """
+        directory = Path(directory) if directory is not None else self.save_dir
+        if not is_usable_save_dir(directory):
+            self.log.info("当前保存目录不可用，跳过记忆：%s", directory)
+            return False
+        config = dict(self.config) if isinstance(self.config, dict) else {}
+        config[CONFIG_KEY_LAST_SAVE_DIR] = str(directory)
+        ok = save_config(config)
+        if ok:
+            self.config = config
+            self.log.info("已记忆上次保存路径：%s", directory)
+        else:
+            self.log.warning("写入配置文件失败（不影响下载）：%s", directory)
+        return ok
 
     # ------------------------------------------------------------------
     # 界面搭建
@@ -397,6 +445,15 @@ class DownloaderApp:
             # 断点续传：只把状态标签的文本换成“正在恢复断点续传…”，
             # 不动任何控件的创建 / 布局 / 尺寸。
             self.status_var.set("正在恢复断点续传…")
+            return
+
+        if kind == "state" and message.get("state") == "probed":
+            # 下载任务已经真正启动（服务器信息探测完成，拿到了 content-length）。
+            # 这时候才记忆保存路径；用户刚点“开始下载”时一个字都不写。
+            # 同样不动任何控件，只更新状态文本 + 写配置文件。
+            directory = message.get("directory") or self.save_dir
+            self._remember_save_dir(directory)
+            self.status_var.set("已开始下载")
             return
 
         if kind == "progress":

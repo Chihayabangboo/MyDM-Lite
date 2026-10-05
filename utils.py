@@ -10,6 +10,7 @@
 * 跨平台“打开文件夹并选中文件”
 * 日志初始化（5MB 轮转，最多保留 3 个日志文件）
 * 断点续传元数据（``<文件名>.download.json``）的原子读写与校验
+* 小配置（``~/.mydm_lite_config.json``）的原子读写与“保存目录是否可用”校验
 """
 
 from __future__ import annotations
@@ -38,6 +39,10 @@ LOG_BACKUP_COUNT = 3  # 最多保留最近 3 个日志文件
 LOG_FORMAT = "%(asctime)s [%(levelname)s] %(message)s"
 LOG_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 
+CONFIG_FILE_NAME = ".mydm_lite_config.json"  # 配置放在用户主目录下
+CONFIG_VERSION = 1
+CONFIG_KEY_LAST_SAVE_DIR = "last_save_dir"  # “上次保存到”的目录
+
 # Windows 文件名里不允许出现的字符（含控制字符）
 _INVALID_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
@@ -61,6 +66,14 @@ __all__ = [
     "LOG_FILE_NAME",
     "LOG_MAX_BYTES",
     "LOG_BACKUP_COUNT",
+    "CONFIG_FILE_NAME",
+    "CONFIG_VERSION",
+    "CONFIG_KEY_LAST_SAVE_DIR",
+    "get_config_path",
+    "load_config",
+    "save_config",
+    "is_usable_save_dir",
+    "resolve_save_dir",
     "parse_content_disposition_filename",
     "filename_from_url",
     "resolve_download_filename",
@@ -318,6 +331,144 @@ def ensure_dir(path) -> Path:
     directory = Path(path)
     directory.mkdir(parents=True, exist_ok=True)
     return directory
+
+
+# ---------------------------------------------------------------------------
+# 小配置（记忆上次保存路径）
+# ---------------------------------------------------------------------------
+#
+# 设计要点：
+# * 配置文件固定放用户主目录下的 ``.mydm_lite_config.json``（``get_config_path()``）；
+# * 读配置**绝不抛异常**：文件不存在 / 不是合法 JSON / 内容不是对象 → 返回 ``{}``，
+#   界面据此静默回退到默认下载目录，绝不给用户弹报错；
+# * 写配置是原子的（先写 ``*.tmp`` 再 ``os.replace``），写一半崩溃也不会留下坏文件；
+# * 所有函数都支持 ``path`` 参数注入，测试可以指定临时路径，
+#   保证测试不会往真实用户主目录里写任何东西。
+
+
+def get_config_path() -> Path:
+    """配置文件路径：用户主目录下的 ``.mydm_lite_config.json``。
+
+    ``Path.home()`` 出问题时用 ``USERPROFILE``/``HOME`` 兜底（见 ``_home_dir``），
+    保证任何环境下都能拿到一个路径而不抛异常。
+    """
+    return _home_dir() / CONFIG_FILE_NAME
+
+
+def load_config(path=None) -> dict:
+    """读取配置，返回 dict。
+
+    只在“文件存在且是合法 JSON 对象”时返回内容；其它情况（不存在、损坏、
+    是数组/字符串、没权限读）一律静默返回空 dict，由调用方回退到默认值。
+    """
+    config_path = _config_path_from(path)
+    try:
+        if not config_path.is_file():
+            return {}
+        with open(config_path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except Exception:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return data
+
+
+def save_config(config_dict, path=None) -> bool:
+    """原子写入配置：先写临时文件，再 ``os.replace`` 覆盖，成功返回 True。
+
+    写入内容一定是 ``dict``（不是 dict 就当成空配置）。
+    写失败（没权限 / 磁盘满）只返回 False 并清掉临时文件，绝不抛异常——
+    记不住“上次保存路径”最多是下次回到默认目录，不能让主流程崩掉。
+    """
+    config_path = _config_path_from(path)
+    payload = dict(config_dict) if isinstance(config_dict, dict) else {}
+    payload.setdefault("version", CONFIG_VERSION)
+
+    temp_path = config_path.with_name(config_path.name + ".tmp")
+    try:
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        text = json.dumps(payload, ensure_ascii=False, indent=2)
+        with open(temp_path, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            try:
+                os.fsync(handle.fileno())
+            except Exception:  # pragma: no cover - 某些文件系统不支持
+                pass
+        os.replace(temp_path, config_path)  # 原子替换，避免半截 JSON
+        return True
+    except Exception:
+        try:
+            if temp_path.exists():
+                temp_path.unlink()
+        except Exception:
+            pass
+        return False
+
+
+def _config_path_from(path) -> Path:
+    """把 ``path`` 参数（None / str / Path）统一成配置文件 Path。"""
+    if path is None:
+        return get_config_path()
+    try:
+        return Path(path)
+    except Exception:  # pragma: no cover - 非法类型兜底
+        return get_config_path()
+
+
+def is_usable_save_dir(path) -> bool:
+    """判断一个保存目录是否可用：存在、是目录、而且**可写**。
+
+    ``os.access(path, os.W_OK)`` 挡不住所有情况（Windows 上 ACL 拒绝时
+    它仍可能返回 True），但能挡住最典型的“只读目录 / 被删掉的目录”，
+    也是需求里明确要求的检查。
+    """
+    if path is None:
+        return False
+    try:
+        target = Path(path)
+    except Exception:  # pragma: no cover - 非法类型
+        return False
+    try:
+        if not target.exists():
+            return False
+        if not target.is_dir():
+            return False
+    except OSError:  # pragma: no cover - 极端路径（超长 / 设备名）
+        return False
+    try:
+        return bool(os.access(target, os.W_OK))
+    except Exception:  # pragma: no cover
+        return False
+
+
+def resolve_save_dir(config: Optional[dict] = None, default=None):
+    """从配置里取“上次保存路径”，不可用时回退到默认下载目录。
+
+    * 回退**复用** ``get_default_download_dir()``，不重复实现默认目录逻辑，
+      避免两处不一致；
+    * 校验同时要求 ``os.path.exists`` 和 ``os.access(W_OK)``（见 ``is_usable_save_dir``）；
+    * 配置缺失 / 损坏（``config`` 不是 dict）同样静默回退，绝不抛异常。
+
+    返回值是 ``Path``：配置里有效时是配置里的目录，否则是默认下载目录。
+    """
+    if default is not None:
+        fallback = Path(default)
+    else:
+        fallback = get_default_download_dir()
+
+    if not isinstance(config, dict):
+        return fallback
+    saved = config.get(CONFIG_KEY_LAST_SAVE_DIR)
+    if not saved or not isinstance(saved, str):
+        return fallback
+    if is_usable_save_dir(saved):
+        try:
+            return Path(saved)
+        except Exception:  # pragma: no cover
+            return fallback
+    return fallback
 
 
 # ---------------------------------------------------------------------------

@@ -87,6 +87,11 @@ MSG_UNKNOWN = "下载失败，请稍后重试"
 MSG_RESUME_STATUS = "正在恢复断点续传…"
 MSG_NO_RANGE_DOWNGRADE = "服务器不支持断点续传，已清空临时文件重新下载"
 
+# 只读事件：服务器信息已经探测完（拿到 content-length / Range 能力），
+# 说明这次下载任务已经真正启动。界面收到它之后才会去记“上次保存路径”。
+# 这里**只上报事实**，不参与任何下载 / 分块 / 合并 / 取消逻辑。
+EVENT_PROBED = "probed"
+
 _LOG = get_logger("mydm.downloader")
 
 
@@ -913,6 +918,18 @@ def download(
         log.info("探测结果：大小=%s，支持 Range=%s，最终地址=%s",
                  content_length, range_supported, probe.final_url)
 
+        # 只读事件：任务已经真正启动（已经探测到 content-length / Range 能力）。
+        # 界面（main.py）监听到它之后才写“上次保存路径”的配置，
+        # 绝不是用户一点“开始下载”就写。这里不改动任何下载行为。
+        _emit_state(progress_cb, EVENT_PROBED, {
+            "content_length": content_length,
+            "range_supported": range_supported,
+            "url": probe.final_url or url,
+            "target": str(target),
+            "directory": str(target.parent),
+            "filename": target.name,
+        })
+
         requested = _safe_int(threads, DEFAULT_THREADS)
         actual_threads = compute_thread_count(
             content_length, range_supported, requested, max_threads=max_threads
@@ -1146,6 +1163,20 @@ def _emit_status(progress_cb: Callable[[dict], None], text: str) -> None:
     progress_cb({"type": "status", "status": text})
 
 
+def _emit_state(progress_cb: Optional[Callable[[dict], None]], state: str, payload: Optional[dict] = None) -> None:
+    """发一条**只读**状态事件给界面（例如 ``state='probed'``）。
+
+    只是把事实塞进队列，不参与任何下载 / 分块 / 合并 / 取消逻辑；
+    ``progress_cb`` 为空时安静地什么都不做。
+    """
+    if progress_cb is None:
+        return
+    message = {"type": "state", "state": state}
+    if payload:
+        message.update(payload)
+    progress_cb(message)
+
+
 def _safe_int(value, default: int) -> int:
     try:
         number = int(value)
@@ -1191,6 +1222,18 @@ def download_to_directory(
         else:
             target = unique_path(plain_target)
         log.info("解析文件名：%s → %s", filename, target)
+        # 只读事件：服务器信息 + 目标文件名都探测完了，这次下载任务确实已经启动。
+        # 界面（main.py）监听到它之后才写“上次保存路径”的配置，
+        # 绝不是用户一点“开始下载”就写。这里不改动任何下载行为。
+        # （下面的 download() 里还会再发一条同样的状态，界面写配置是幂等的。）
+        _emit_state(progress_cb, EVENT_PROBED, {
+            "content_length": probe.content_length,
+            "range_supported": probe.range_supported,
+            "url": probe.final_url or url,
+            "target": str(target),
+            "directory": str(directory),
+            "filename": target.name,
+        })
         return download(
             url=url, target=target, threads=threads, cancel_event=cancel_event,
             progress_cb=progress_cb, session=session, logger=log,
